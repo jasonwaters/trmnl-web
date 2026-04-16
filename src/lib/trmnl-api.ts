@@ -1,12 +1,15 @@
 // TRMNL API Service
 // Handles communication with the TRMNL API
 
+import { debugLog } from "./debug";
+
 const HOSTS = {
   development: "http://localhost:3000",
   production: "https://usetrmnl.com",
 };
 
 const DEFAULT_REFRESH_RATE = 30; // seconds
+const FALLBACK_ENVIRONMENT: Environment = "production";
 
 export type Environment = "development" | "production";
 
@@ -19,7 +22,7 @@ export interface Device {
 }
 
 export interface CurrentImage {
-  url: string; // base64 data URL
+  url: string; // data URL used for rendering
   originalUrl: string; // CDN URL from API
   filename: string;
   timestamp: number;
@@ -27,6 +30,8 @@ export interface CurrentImage {
 
 export interface TrmnlState {
   environment: Environment;
+  baseUrl: string;
+  macAddress: string | null;
   devices: Device[];
   selectedDevice: Device | null;
   currentImage: CurrentImage | null;
@@ -35,11 +40,14 @@ export interface TrmnlState {
   refreshRate: number;
   retryCount: number;
   retryAfter: number | null;
+  lastError: string | null;
 }
 
 // Storage keys
 const STORAGE_KEYS = {
   environment: "trmnl_environment",
+  baseUrl: "trmnl_baseUrl",
+  macAddress: "trmnl_macAddress",
   devices: "trmnl_devices",
   selectedDevice: "trmnl_selectedDevice",
   currentImage: "trmnl_currentImage",
@@ -48,8 +56,127 @@ const STORAGE_KEYS = {
   refreshRate: "trmnl_refreshRate",
   retryCount: "trmnl_retryCount",
   retryAfter: "trmnl_retryAfter",
+  lastError: "trmnl_lastError",
   firstSetupComplete: "trmnl_firstSetupComplete",
 };
+
+function normalizeBaseUrl(input: string): string | null {
+  const trimmedInput = input.trim().replace(/\/+$/, "");
+  if (!trimmedInput) {
+    return null;
+  }
+
+  const withProtocol = /^https?:\/\//i.test(trimmedInput)
+    ? trimmedInput
+    : `https://${trimmedInput}`;
+
+  try {
+    const parsedUrl = new URL(withProtocol);
+    if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+      return null;
+    }
+    return parsedUrl.origin;
+  } catch {
+    return null;
+  }
+}
+
+function resolveBaseUrl(
+  configuredBaseUrl: string | null | undefined,
+  environment: Environment
+): string {
+  const envBaseUrl = normalizeBaseUrl(
+    String(import.meta.env.VITE_TRMNL_BASE_URL ?? "")
+  );
+
+  return (
+    normalizeBaseUrl(configuredBaseUrl ?? "") ??
+    envBaseUrl ??
+    HOSTS[environment] ??
+    HOSTS.production
+  );
+}
+
+function normalizeMacAddress(input: string): string | null {
+  const normalized = input.trim().toUpperCase().replace(/[^0-9A-F]/g, "");
+  if (normalized.length !== 12) {
+    return null;
+  }
+
+  const pairs = normalized.match(/.{1,2}/g);
+  if (!pairs || pairs.length !== 6) {
+    return null;
+  }
+
+  return pairs.join(":");
+}
+
+function resolveDeviceMacAddress(
+  selectedDevice: Device | null,
+  stateMacAddress: string | null
+): string | null {
+  if (stateMacAddress) {
+    return stateMacAddress;
+  }
+
+  if (typeof selectedDevice?.mac_address === "string") {
+    return normalizeMacAddress(selectedDevice.mac_address);
+  }
+
+  return null;
+}
+
+function buildDeviceHeaders(
+  apiKey: string,
+  macAddress: string | null,
+  additionalHeaders: Record<string, string> = {}
+): HeadersInit {
+  const headers: Record<string, string> = {
+    "Access-Token": apiKey,
+    "Cache-Control": "no-cache",
+    ...additionalHeaders,
+  };
+
+  if (macAddress) {
+    headers.ID = macAddress;
+  }
+
+  return headers;
+}
+
+function getCurrentScreenApiUrls(environment: Environment): string[] {
+  const baseUrl = getBaseUrl(environment);
+  return [`${baseUrl}/api/display/current`, `${baseUrl}/api/current_screen`];
+}
+
+function resolveImageUrl(imageUrl: unknown, baseUrl: string): string | null {
+  if (typeof imageUrl !== "string" || !imageUrl.trim()) {
+    return null;
+  }
+
+  try {
+    return new URL(imageUrl, baseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+async function createHttpError(
+  response: Response,
+  contextLabel: string
+): Promise<Error> {
+  let responseBody = "";
+  try {
+    responseBody = (await response.text()).trim();
+  } catch {
+    responseBody = "";
+  }
+
+  const details = responseBody ? ` - ${responseBody.slice(0, 300)}` : "";
+  return new Error(
+    `${contextLabel} failed (${response.status} ${response.statusText})${details}`
+  );
+}
 
 // Helper functions for localStorage
 function getStorageItem<T>(key: string, defaultValue: T): T {
@@ -71,11 +198,19 @@ function setStorageItem<T>(key: string, value: T): void {
 
 // Get the current state from localStorage
 export function getState(): TrmnlState {
+  const environment = getStorageItem<Environment>(
+    STORAGE_KEYS.environment,
+    FALLBACK_ENVIRONMENT
+  );
+  const configuredBaseUrl = getStorageItem<string | null>(
+    STORAGE_KEYS.baseUrl,
+    null
+  );
+
   return {
-    environment: getStorageItem<Environment>(
-      STORAGE_KEYS.environment,
-      "production"
-    ),
+    environment,
+    baseUrl: resolveBaseUrl(configuredBaseUrl, environment),
+    macAddress: getStorageItem<string | null>(STORAGE_KEYS.macAddress, null),
     devices: getStorageItem<Device[]>(STORAGE_KEYS.devices, []),
     selectedDevice: getStorageItem<Device | null>(
       STORAGE_KEYS.selectedDevice,
@@ -93,6 +228,7 @@ export function getState(): TrmnlState {
     ),
     retryCount: getStorageItem<number>(STORAGE_KEYS.retryCount, 0),
     retryAfter: getStorageItem<number | null>(STORAGE_KEYS.retryAfter, null),
+    lastError: getStorageItem<string | null>(STORAGE_KEYS.lastError, null),
   };
 }
 
@@ -100,6 +236,12 @@ export function getState(): TrmnlState {
 export function updateState(updates: Partial<TrmnlState>): TrmnlState {
   if (updates.environment !== undefined) {
     setStorageItem(STORAGE_KEYS.environment, updates.environment);
+  }
+  if (updates.baseUrl !== undefined) {
+    setStorageItem(STORAGE_KEYS.baseUrl, updates.baseUrl);
+  }
+  if (updates.macAddress !== undefined) {
+    setStorageItem(STORAGE_KEYS.macAddress, updates.macAddress);
   }
   if (updates.devices !== undefined) {
     setStorageItem(STORAGE_KEYS.devices, updates.devices);
@@ -125,6 +267,9 @@ export function updateState(updates: Partial<TrmnlState>): TrmnlState {
   if (updates.retryAfter !== undefined) {
     setStorageItem(STORAGE_KEYS.retryAfter, updates.retryAfter);
   }
+  if (updates.lastError !== undefined) {
+    setStorageItem(STORAGE_KEYS.lastError, updates.lastError);
+  }
   return getState();
 }
 
@@ -137,7 +282,7 @@ export function clearState(): void {
 
 // URL construction
 function getBaseUrl(environment: Environment): string {
-  return HOSTS[environment] || HOSTS.production;
+  return resolveBaseUrl(getState().baseUrl, environment);
 }
 
 export function getDevicesUrl(environment: Environment): string {
@@ -152,22 +297,63 @@ export function getLoginUrl(environment: Environment): string {
   return `${getBaseUrl(environment)}/login`;
 }
 
-// Fetch devices from TRMNL API
-// Note: This requires the user to be logged in to usetrmnl.com in the same browser
+export function setBaseUrl(baseUrl: string): string | null {
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  if (!normalizedBaseUrl) {
+    return "Enter a valid server URL (for example: https://paper.example.com).";
+  }
+
+  updateState({
+    baseUrl: normalizedBaseUrl,
+    retryAfter: null,
+    retryCount: 0,
+    lastError: null,
+  });
+
+  return null;
+}
+
+export function setMacAddress(macAddress: string): string | null {
+  if (!macAddress.trim()) {
+    updateState({ macAddress: null, lastError: null });
+    return null;
+  }
+
+  const normalizedMacAddress = normalizeMacAddress(macAddress);
+  if (!normalizedMacAddress) {
+    return "Enter a valid MAC address (for example: 41:B4:10:39:A1:24).";
+  }
+
+  updateState({ macAddress: normalizedMacAddress, lastError: null });
+  return null;
+}
+
+// Fetch devices from server API
+// Note: This requires the user to be logged in to the configured server in the same browser
 // for cookie-based authentication to work
 export async function fetchDevices(
   environment: Environment
 ): Promise<Device[] | null> {
   const url = getDevicesUrl(environment);
   const storedDevices = getStorageItem<Device[]>(STORAGE_KEYS.devices, []);
+  debugLog("Fetching device list", { url, environment });
 
   try {
     const response = await fetch(url, {
       credentials: "include", // Include cookies for authentication
     });
+    debugLog("Device list response received", {
+      url,
+      status: response.status,
+      statusText: response.statusText,
+    });
 
     if (response.status === 401 || response.status === 403) {
       console.log("Unauthorized - user needs to log in");
+      updateState({
+        lastError:
+          "Device list unauthorized. Log in to your configured server and try again.",
+      });
       if (storedDevices.length > 0) {
         console.log("Using cached devices");
         return storedDevices;
@@ -178,15 +364,18 @@ export async function fetchDevices(
     if (!response.ok) {
       if (storedDevices.length > 0) {
         console.log("Fetch error, using cached devices");
+        updateState({
+          lastError: `Device list failed (${response.status}); using cached devices.`,
+        });
         return storedDevices;
       }
-      throw new Error(`HTTP error: ${response.status}`);
+      throw await createHttpError(response, "Device list request");
     }
 
     const devices: Device[] = await response.json();
 
     // Store the devices
-    updateState({ devices });
+    updateState({ devices, lastError: null });
 
     // Auto-select first device if none selected
     const state = getState();
@@ -197,6 +386,12 @@ export async function fetchDevices(
     return devices;
   } catch (error) {
     console.error("Error fetching devices:", error);
+    updateState({
+      lastError:
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch devices from configured server.",
+    });
     if (storedDevices.length > 0) {
       return storedDevices;
     }
@@ -214,10 +409,67 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
+function buildImageDownloadRequest(imageUrl: string): {
+  requestUrl: string;
+  requestInit?: RequestInit;
+} {
+  if (!import.meta.env.DEV) {
+    return { requestUrl: imageUrl };
+  }
+
+  return {
+    requestUrl: "/__trmnl_proxy",
+    requestInit: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: imageUrl }),
+    },
+  };
+}
+
+async function resolveDisplayImageUrl(imageUrl: string): Promise<string> {
+  try {
+    const { requestUrl, requestInit } = buildImageDownloadRequest(imageUrl);
+    const imageResponse = await fetch(requestUrl, requestInit);
+    debugLog("Image download response received", {
+      imageUrl,
+      requestUrl,
+      status: imageResponse.status,
+      statusText: imageResponse.statusText,
+    });
+
+    if (!imageResponse.ok) {
+      throw await createHttpError(imageResponse, "Image download request");
+    }
+
+    const imageBlob = await imageResponse.blob();
+    return await blobToDataUrl(imageBlob);
+  } catch (error) {
+    const reason =
+      error instanceof Error ? error.message : "Unknown image download error";
+    debugLog("Unable to encode image as data URL", {
+      imageUrl,
+      reason,
+    });
+    throw new Error(
+      `Failed to encode image as data URL: ${reason}. Ensure image endpoint allows browser fetch/CORS or return Base64 from API.`
+    );
+  }
+}
+
 // Fetch the next screen image (triggers screen update on device)
 export async function fetchNextScreen(): Promise<string | null> {
   const state = getState();
-  const { environment, selectedDevice, retryAfter, retryCount } = state;
+  const {
+    environment,
+    baseUrl,
+    selectedDevice,
+    macAddress: stateMacAddress,
+    retryAfter,
+    retryCount,
+  } = state;
 
   // Check if we're in a retry backoff period
   if (retryAfter && Date.now() < retryAfter) {
@@ -229,23 +481,38 @@ export async function fetchNextScreen(): Promise<string | null> {
   const apiKey = selectedDevice?.api_key;
   if (!apiKey) {
     console.log("No API key available");
+    updateState({ lastError: "No API key available for the selected device." });
     return null;
   }
 
-  const API_URL = `${getBaseUrl(environment)}/api/display`;
+  const macAddress = resolveDeviceMacAddress(selectedDevice, stateMacAddress);
+  const API_URL = `${baseUrl || getBaseUrl(environment)}/api/display`;
+  const requestHeaders = buildDeviceHeaders(apiKey, macAddress);
+  debugLog("Fetching next screen", {
+    url: API_URL,
+    hasApiKey: Boolean(apiKey),
+    macAddress,
+  });
 
   try {
     // Fetch the next screen
     const response = await fetch(API_URL, {
-      headers: {
-        "Access-Token": apiKey,
-        "Cache-Control": "no-cache",
-      },
+      headers: requestHeaders,
+    });
+    debugLog("Next screen response received", {
+      url: API_URL,
+      status: response.status,
+      statusText: response.statusText,
     });
 
     if (response.status === 401 || response.status === 403) {
       console.log("API key unauthorized");
-      updateState({ retryCount: 0, retryAfter: null });
+      updateState({
+        retryCount: 0,
+        retryAfter: null,
+        lastError:
+          "API key unauthorized for this server. Verify the key belongs to this instance.",
+      });
       return null;
     }
 
@@ -258,28 +525,58 @@ export async function fetchNextScreen(): Promise<string | null> {
       updateState({
         retryCount: newRetryCount,
         retryAfter: retryAfterTime,
+        lastError: `Rate limited by server. Retry in ${Math.ceil(backoffMs / 1000)}s.`,
       });
       return null;
     }
 
     if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status}`);
+      throw await createHttpError(response, "Next screen request");
     }
 
     const data = await response.json();
-    const imageUrl = data.image_url;
+    const imageUrl = resolveImageUrl(data.image_url, baseUrl || getBaseUrl(environment));
     const filename = data.filename || "display.jpg";
     const refreshRate = data.refresh_rate || DEFAULT_REFRESH_RATE;
     const currentTime = Date.now();
+    debugLog("Next screen metadata parsed", {
+      imageUrl,
+      filename,
+      refreshRate,
+      rawImageUrl: data.image_url ?? null,
+    });
 
-    // Fetch the actual image
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error(`Failed to fetch image: ${imageResponse.status}`);
+    if (!imageUrl) {
+      if (
+        typeof data.image_url === "string" &&
+        data.image_url.startsWith("data:image/")
+      ) {
+        const nextFetchFromInline = currentTime + refreshRate * 1000;
+        updateState({
+          currentImage: {
+            url: data.image_url,
+            originalUrl: "inline-base64",
+            filename,
+            timestamp: currentTime,
+          },
+          lastFetch: currentTime,
+          nextFetch: nextFetchFromInline,
+          refreshRate,
+          retryCount: 0,
+          retryAfter: null,
+          lastError: null,
+        });
+        return data.image_url;
+      }
+
+      const metadataError =
+        "Server returned next-screen metadata without a valid image_url.";
+      debugLog(metadataError, { payload: data });
+      updateState({ lastError: metadataError });
+      return null;
     }
 
-    const imageBlob = await imageResponse.blob();
-    const imageDataUrl = await blobToDataUrl(imageBlob);
+    const imageDataUrl = await resolveDisplayImageUrl(imageUrl);
 
     // Calculate next fetch time
     const nextFetch = currentTime + refreshRate * 1000;
@@ -297,6 +594,7 @@ export async function fetchNextScreen(): Promise<string | null> {
       refreshRate,
       retryCount: 0,
       retryAfter: null,
+      lastError: null,
     });
 
     return imageDataUrl;
@@ -310,6 +608,10 @@ export async function fetchNextScreen(): Promise<string | null> {
     updateState({
       retryCount: newRetryCount,
       retryAfter: retryAfterTime,
+      lastError:
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch the next screen.",
     });
     return null;
   }
@@ -318,39 +620,66 @@ export async function fetchNextScreen(): Promise<string | null> {
 // Trigger special function (e.g., previous screen)
 export async function triggerSpecialFunction(): Promise<boolean> {
   const state = getState();
-  const { environment, selectedDevice } = state;
+  const { environment, baseUrl, selectedDevice, macAddress: stateMacAddress } =
+    state;
 
   // Get API key from selected device
   const apiKey = selectedDevice?.api_key;
   if (!apiKey) {
     console.log("No API key available");
+    updateState({ lastError: "No API key available for the selected device." });
     return false;
   }
 
-  const API_URL = `${getBaseUrl(environment)}/api/display`;
+  const macAddress = resolveDeviceMacAddress(selectedDevice, stateMacAddress);
+  const API_URL = `${baseUrl || getBaseUrl(environment)}/api/display`;
+  const requestHeaders = buildDeviceHeaders(
+    apiKey,
+    macAddress,
+    {
+      "Special-Function": "true",
+    }
+  );
+  debugLog("Triggering special function", {
+    url: API_URL,
+    hasApiKey: Boolean(apiKey),
+    macAddress,
+  });
 
   try {
     const response = await fetch(API_URL, {
-      headers: {
-        "Access-Token": apiKey,
-        "Special-Function": "true",
-        "Cache-Control": "no-cache",
-      },
+      headers: requestHeaders,
+    });
+    debugLog("Special function response received", {
+      url: API_URL,
+      status: response.status,
+      statusText: response.statusText,
     });
 
     if (response.status === 401 || response.status === 403) {
       console.log("API key unauthorized");
+      updateState({
+        lastError:
+          "API key unauthorized for this server. Verify the key belongs to this instance.",
+      });
       return false;
     }
 
     if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status}`);
+      throw await createHttpError(response, "Special function request");
     }
 
     console.log("Special function triggered successfully");
+    updateState({ lastError: null });
     return true;
   } catch (error) {
     console.error("Error triggering special function:", error);
+    updateState({
+      lastError:
+        error instanceof Error
+          ? error.message
+          : "Failed to trigger special function.",
+    });
     return false;
   }
 }
@@ -358,8 +687,15 @@ export async function triggerSpecialFunction(): Promise<boolean> {
 // Fetch the current screen image
 export async function fetchImage(forceRefresh = false): Promise<string | null> {
   const state = getState();
-  const { environment, selectedDevice, currentImage, retryAfter, retryCount } =
-    state;
+  const {
+    environment,
+    baseUrl,
+    selectedDevice,
+    macAddress: stateMacAddress,
+    currentImage,
+    retryAfter,
+    retryCount,
+  } = state;
 
   // Check if we're in a retry backoff period
   if (retryAfter && Date.now() < retryAfter && !forceRefresh) {
@@ -371,34 +707,74 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
   const apiKey = selectedDevice?.api_key;
   if (!apiKey) {
     console.log("No API key available");
+    updateState({ lastError: "No API key available for the selected device." });
     return null;
   }
 
+  const macAddress = resolveDeviceMacAddress(selectedDevice, stateMacAddress);
   const deviceId = selectedDevice?.id || "unknown";
   const isFirstSetup = !hasCompletedFirstSetup(deviceId);
 
-  // Use /api/display for first-time setup to generate screen, otherwise use /api/current_screen
-  const API_URL = isFirstSetup
-    ? `${getBaseUrl(environment)}/api/display`
-    : getApiUrl(environment);
+  // Use /api/display when we explicitly want a fresh render (first setup or force refresh).
+  // Otherwise prefer read-only current screen endpoints.
+  const shouldUseDisplayEndpoint = isFirstSetup || forceRefresh;
+  const apiUrls = shouldUseDisplayEndpoint
+    ? [`${baseUrl || getBaseUrl(environment)}/api/display`]
+    : getCurrentScreenApiUrls(environment);
+  const requestHeaders = buildDeviceHeaders(apiKey, macAddress);
 
   console.log(
     `Fetching image for device ${deviceId} (first setup: ${isFirstSetup})`
   );
+  debugLog("Fetching display image", {
+    deviceId,
+    isFirstSetup,
+    forceRefresh,
+    shouldUseDisplayEndpoint,
+    apiUrls,
+    macAddress,
+  });
 
   try {
-    // Fetch the current screen metadata
-    const response = await fetch(API_URL, {
-      headers: {
-        "access-token": apiKey,
-        "Cache-Control": "no-cache",
-      },
-    });
+    let response: Response | null = null;
+    let apiUrlUsed = apiUrls[0];
+
+    // Fetch metadata with endpoint fallback for BYOS compatibility
+    for (const candidateUrl of apiUrls) {
+      apiUrlUsed = candidateUrl;
+      response = await fetch(candidateUrl, {
+        headers: requestHeaders,
+      });
+
+      debugLog("Display metadata response received", {
+        url: candidateUrl,
+        status: response.status,
+        statusText: response.statusText,
+      });
+
+      if (response.status === 404 && apiUrls.length > 1) {
+        debugLog("Display metadata endpoint returned 404, trying fallback", {
+          failedUrl: candidateUrl,
+        });
+        continue;
+      }
+
+      break;
+    }
+
+    if (!response) {
+      throw new Error("No display endpoint was attempted.");
+    }
 
     if (response.status === 401 || response.status === 403) {
       console.log("API key unauthorized");
       // Reset retry state
-      updateState({ retryCount: 0, retryAfter: null });
+      updateState({
+        retryCount: 0,
+        retryAfter: null,
+        lastError:
+          "API key unauthorized for this server. Verify the key belongs to this instance.",
+      });
       return null;
     }
 
@@ -412,28 +788,83 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
       updateState({
         retryCount: newRetryCount,
         retryAfter: retryAfterTime,
+        lastError: `Rate limited by server. Retry in ${Math.ceil(backoffMs / 1000)}s.`,
       });
 
       return currentImage?.url || null;
     }
 
     if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status}`);
+      throw await createHttpError(
+        response,
+        `Display metadata request (${apiUrlUsed})`
+      );
     }
 
     const data = await response.json();
-    const imageUrl = data.image_url;
+    const effectiveBaseUrl = baseUrl || getBaseUrl(environment);
+    const imageUrl = resolveImageUrl(data.image_url, effectiveBaseUrl);
     const filename = data.filename || "display.jpg";
     const refreshRate = data.refresh_rate || DEFAULT_REFRESH_RATE;
     const currentTime = Date.now();
+    debugLog("Display metadata parsed", {
+      imageUrl,
+      filename,
+      refreshRate,
+      rawImageUrl: data.image_url ?? null,
+      renderedAt: data.rendered_at ?? null,
+    });
 
-    // Check if image URL has changed (optimization to skip re-download)
+    if (!imageUrl) {
+      if (
+        typeof data.image_url === "string" &&
+        data.image_url.startsWith("data:image/")
+      ) {
+        const nextFetchFromInline = currentTime + refreshRate * 1000;
+        updateState({
+          currentImage: {
+            url: data.image_url,
+            originalUrl: "inline-base64",
+            filename,
+            timestamp: currentTime,
+          },
+          lastFetch: currentTime,
+          nextFetch: nextFetchFromInline,
+          refreshRate,
+          retryCount: 0,
+          retryAfter: null,
+          lastError: null,
+        });
+
+        if (isFirstSetup) {
+          markFirstSetupComplete(deviceId);
+          console.log(`First setup completed for device ${deviceId}`);
+        }
+
+        return data.image_url;
+      }
+
+      const metadataError =
+        "Server returned display metadata without a valid image_url.";
+      debugLog(metadataError, { payload: data });
+      updateState({ lastError: metadataError });
+      return currentImage?.url || null;
+    }
+
+    const hasDataUrlCachedImage =
+      typeof currentImage?.url === "string" &&
+      currentImage.url.startsWith("data:image/");
+
+    // Check if image URL has changed (optimization to skip re-download).
+    // Only reuse cached image when it is already an encoded data URL.
     if (
       !forceRefresh &&
       currentImage &&
-      currentImage.originalUrl === imageUrl
+      currentImage.originalUrl === imageUrl &&
+      hasDataUrlCachedImage
     ) {
       console.log("Image unchanged, updating timestamps only");
+      debugLog("Image URL unchanged; skipping download", { imageUrl });
       const nextFetch = currentTime + refreshRate * 1000;
       updateState({
         refreshRate,
@@ -445,14 +876,17 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
       return currentImage.url;
     }
 
-    // Fetch the actual image
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error(`Failed to fetch image: ${imageResponse.status}`);
+    if (!forceRefresh && currentImage && currentImage.originalUrl === imageUrl) {
+      debugLog(
+        "Image URL unchanged but cached src is not data URL; re-encoding image",
+        {
+          imageUrl,
+          cachedSourcePrefix: currentImage.url.slice(0, 40),
+        }
+      );
     }
 
-    const imageBlob = await imageResponse.blob();
-    const imageDataUrl = await blobToDataUrl(imageBlob);
+    const imageDataUrl = await resolveDisplayImageUrl(imageUrl);
 
     // Calculate next fetch time
     const nextFetch = currentTime + refreshRate * 1000;
@@ -470,6 +904,7 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
       refreshRate,
       retryCount: 0,
       retryAfter: null,
+      lastError: null,
     });
 
     // Mark first setup as complete after successful fetch
@@ -490,6 +925,10 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
     updateState({
       retryCount: newRetryCount,
       retryAfter: retryAfterTime,
+      lastError:
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch image from configured server.",
     });
 
     return currentImage?.url || null;
@@ -502,12 +941,17 @@ export function selectDevice(device: Device): void {
     selectedDevice: device,
     retryCount: 0,
     retryAfter: null,
+    lastError: null,
   });
 }
 
 // Set the environment
 export function setEnvironment(environment: Environment): void {
-  updateState({ environment });
+  updateState({
+    environment,
+    baseUrl: resolveBaseUrl(getStorageItem(STORAGE_KEYS.baseUrl, null), environment),
+    lastError: null,
+  });
 }
 
 // Check if device has completed first setup

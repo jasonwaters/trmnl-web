@@ -7,6 +7,8 @@ import {
   triggerSpecialFunction,
   selectDevice,
   setEnvironment,
+  setBaseUrl,
+  setMacAddress,
   formatTimeRemaining,
   getLoginUrl,
   updateState,
@@ -19,7 +21,9 @@ import {
 const stateListeners = new Set<() => void>();
 
 function notifyStateChange() {
-  stateListeners.forEach((listener) => listener());
+  stateListeners.forEach((listener) => {
+    listener();
+  });
 }
 
 // Wrap update functions to notify listeners
@@ -31,6 +35,24 @@ function wrappedSelectDevice(device: Device) {
 function wrappedSetEnvironment(environment: Environment) {
   setEnvironment(environment);
   notifyStateChange();
+}
+
+function wrappedSetBaseUrl(baseUrl: string) {
+  const validationError = setBaseUrl(baseUrl);
+  if (validationError) {
+    return validationError;
+  }
+  notifyStateChange();
+  return null;
+}
+
+function wrappedSetMacAddress(macAddress: string) {
+  const validationError = setMacAddress(macAddress);
+  if (validationError) {
+    return validationError;
+  }
+  notifyStateChange();
+  return null;
 }
 
 export function useTrmnl() {
@@ -66,7 +88,11 @@ export function useTrmnl() {
     try {
       const devices = await fetchDevices(state.environment);
       if (!devices || devices.length === 0) {
-        setError("No devices found. Please enter your API key manually.");
+        const currentState = getState();
+        setError(
+          currentState.lastError ??
+            "No devices found. Please enter your API key manually."
+        );
       }
       refreshState();
     } catch (err) {
@@ -109,7 +135,11 @@ export function useTrmnl() {
       try {
         const imageUrl = await fetchImage(forceRefresh);
         if (!imageUrl) {
-          setError("Failed to load image. Please check your API key.");
+          const currentState = getState();
+          setError(
+            currentState.lastError ??
+              "Failed to load image. Please check your API key."
+          );
         }
         refreshState();
       } catch (err) {
@@ -144,7 +174,11 @@ export function useTrmnl() {
     try {
       const imageUrl = await fetchNextScreen();
       if (!imageUrl) {
-        setError("Failed to load next screen. Please check your API key.");
+        const currentState = getState();
+        setError(
+          currentState.lastError ??
+            "Failed to load next screen. Please check your API key."
+        );
       }
       refreshState();
     } catch (err) {
@@ -167,8 +201,10 @@ export function useTrmnl() {
     try {
       const success = await triggerSpecialFunction();
       if (!success) {
+        const currentState = getState();
         setError(
-          "Failed to trigger previous screen. Ensure special function is configured."
+          currentState.lastError ??
+            "Failed to trigger previous screen. Ensure special function is configured."
         );
       }
     } catch (err) {
@@ -277,7 +313,11 @@ export function useTrmnl() {
       try {
         const imageUrl = await fetchImage(true);
         if (!imageUrl) {
-          setError("Failed to load image. Please check your API key.");
+          const currentState = getState();
+          setError(
+            currentState.lastError ??
+              "Failed to load image. Please check your API key."
+          );
         }
         refreshState();
       } catch (err) {
@@ -296,6 +336,76 @@ export function useTrmnl() {
     window.open(loginUrl, "_blank");
   }, [state.environment]);
 
+  const changeBaseUrl = useCallback(
+    async (baseUrl: string) => {
+      const validationError = wrappedSetBaseUrl(baseUrl);
+      if (validationError) {
+        setError(validationError);
+        return false;
+      }
+
+      setError(null);
+      refreshState();
+      return true;
+    },
+    [refreshState]
+  );
+
+  const changeMacAddress = useCallback(
+    async (macAddress: string) => {
+      const validationError = wrappedSetMacAddress(macAddress);
+      if (validationError) {
+        setError(validationError);
+        return false;
+      }
+
+      setError(null);
+      refreshState();
+      return true;
+    },
+    [refreshState]
+  );
+
+  const changeApiKey = useCallback(
+    async (apiKey: string) => {
+      const trimmedApiKey = apiKey.trim();
+      if (!trimmedApiKey) {
+        setError("API key cannot be empty.");
+        return false;
+      }
+
+      const currentState = getState();
+      const selectedDevice = currentState.selectedDevice;
+
+      if (!selectedDevice) {
+        await saveManualApiKey(trimmedApiKey);
+        return true;
+      }
+
+      const updatedSelectedDevice: Device = {
+        ...selectedDevice,
+        api_key: trimmedApiKey,
+      };
+      const updatedDevices = currentState.devices.map((device) =>
+        device.id === selectedDevice.id ? updatedSelectedDevice : device
+      );
+
+      updateState({
+        devices: updatedDevices,
+        selectedDevice: updatedSelectedDevice,
+        retryCount: 0,
+        retryAfter: null,
+        lastError: null,
+      });
+
+      notifyStateChange();
+      setError(null);
+      refreshState();
+      return true;
+    },
+    [refreshState, saveManualApiKey]
+  );
+
   // Initialize - load devices and image on first mount
   useEffect(() => {
     const init = async () => {
@@ -306,8 +416,8 @@ export function useTrmnl() {
       }
     };
 
-    init();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    void init();
+  }, [loadImage]);
 
   return {
     // State
@@ -324,6 +434,9 @@ export function useTrmnl() {
     previousScreen,
     changeDevice,
     changeEnvironment,
+    changeBaseUrl,
+    changeMacAddress,
+    changeApiKey,
     saveManualApiKey,
     openLogin,
     refreshState,

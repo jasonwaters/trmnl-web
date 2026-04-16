@@ -1,5 +1,5 @@
 import { RotateCcw, Settings, SkipForward } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
 import { useTrmnl } from "./hooks/useTrmnl";
 
@@ -12,20 +12,99 @@ function App() {
     forceRefresh,
     nextScreen,
     changeDevice,
-    loadDevices,
-    saveManualApiKey,
+    changeBaseUrl,
+    changeMacAddress,
+    changeApiKey,
   } = useTrmnl();
 
-  const { currentImage, selectedDevice, devices } = state;
+  const {
+    currentImage,
+    selectedDevice,
+    devices,
+    baseUrl,
+    macAddress,
+  } = state;
   const [showSettings, setShowSettings] = useState(false);
-  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKeyInput, setApiKeyInput] = useState(selectedDevice?.api_key ?? "");
+  const [serverUrlInput, setServerUrlInput] = useState(baseUrl);
+  const [macAddressInput, setMacAddressInput] = useState(macAddress ?? "");
+  const dashboardUrl = `${baseUrl}/dashboard`;
 
-  const handleSaveApiKey = () => {
-    if (apiKeyInput.trim()) {
-      saveManualApiKey(apiKeyInput.trim());
-      setApiKeyInput("");
-      setShowSettings(false);
+  useEffect(() => {
+    setServerUrlInput(baseUrl);
+  }, [baseUrl]);
+
+  useEffect(() => {
+    setMacAddressInput(macAddress ?? "");
+  }, [macAddress]);
+
+  useEffect(() => {
+    setApiKeyInput(selectedDevice?.api_key ?? "");
+  }, [selectedDevice?.api_key]);
+
+  const saveConnectionConfig = async (
+    options: { requireApiKey: boolean; refreshAfterSave: boolean }
+  ) => {
+    const normalizedServerUrl = serverUrlInput.trim();
+    const normalizedMacAddress = macAddressInput.trim();
+    const normalizedApiKey = apiKeyInput.trim();
+
+    if (options.requireApiKey && !normalizedApiKey) {
+      return false;
     }
+
+    if (normalizedServerUrl && normalizedServerUrl !== baseUrl) {
+      const serverSaved = await changeBaseUrl(normalizedServerUrl);
+      if (!serverSaved) {
+        return false;
+      }
+    }
+
+    if (normalizedMacAddress !== (macAddress ?? "")) {
+      const macSaved = await changeMacAddress(normalizedMacAddress);
+      if (!macSaved) {
+        return false;
+      }
+    }
+
+    const currentApiKey = selectedDevice?.api_key ?? "";
+    if (normalizedApiKey !== currentApiKey) {
+      const apiSaved = await changeApiKey(normalizedApiKey);
+      if (!apiSaved) {
+        return false;
+      }
+    }
+
+    if (options.refreshAfterSave) {
+      await forceRefresh();
+    }
+
+    return true;
+  };
+
+  const handleConnect = async () => {
+    const saved = await saveConnectionConfig({
+      requireApiKey: true,
+      refreshAfterSave: false,
+    });
+    if (!saved) {
+      return;
+    }
+
+    setApiKeyInput("");
+    setShowSettings(false);
+  };
+
+  const handleSaveSettings = async () => {
+    const saved = await saveConnectionConfig({
+      requireApiKey: false,
+      refreshAfterSave: true,
+    });
+    if (!saved) {
+      return;
+    }
+
+    setShowSettings(false);
   };
 
   // Render login prompt if no devices and no selected device with API key
@@ -38,15 +117,50 @@ function App() {
             <p>View your TRMNL device display right in your browser.</p>
 
             <div className="trmnl-setup-section">
+              <h3>Server URL</h3>
+              <p className="trmnl-note">
+                Point this app to your TRMNL-compatible instance (for example,
+                Larapaper).
+              </p>
+              <div className="trmnl-input-group">
+                <input
+                  type="text"
+                  value={serverUrlInput}
+                  onChange={(e) => setServerUrlInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void handleConnect()}
+                  placeholder="https://paper.example.com"
+                  className="trmnl-input"
+                />
+              </div>
+            </div>
+
+            <div className="trmnl-setup-section">
+              <h3>MAC Address (Optional)</h3>
+              <p className="trmnl-note">
+                Some servers map requests using API key + MAC address.
+              </p>
+              <div className="trmnl-input-group">
+                <input
+                  type="text"
+                  value={macAddressInput}
+                  onChange={(e) => setMacAddressInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void handleConnect()}
+                  placeholder="41:B4:10:39:A1:24"
+                  className="trmnl-input"
+                />
+              </div>
+            </div>
+
+            <div className="trmnl-setup-section">
               <h3>Enter Your API Key</h3>
               <p className="trmnl-note">
                 You can find your device API key in your{" "}
                 <a
-                  href="https://usetrmnl.com/dashboard"
+                  href={dashboardUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  TRMNL Dashboard
+                  Dashboard
                 </a>{" "}
                 under Device Settings.
               </p>
@@ -55,12 +169,13 @@ function App() {
                   type="text"
                   value={apiKeyInput}
                   onChange={(e) => setApiKeyInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleSaveApiKey()}
+                  onKeyDown={(e) => e.key === "Enter" && void handleConnect()}
                   placeholder="Paste your device API key"
                   className="trmnl-input"
                 />
                 <button
-                  onClick={handleSaveApiKey}
+                  onClick={() => void handleConnect()}
+                  type="button"
                   className="trmnl-button"
                   disabled={!apiKeyInput.trim()}
                 >
@@ -118,7 +233,7 @@ function App() {
           {!isLoading && !currentImage && selectedDevice && (
             <div className="trmnl-no-image">
               <p>No image available</p>
-              <button onClick={forceRefresh} className="trmnl-button">
+              <button onClick={forceRefresh} type="button" className="trmnl-button">
                 Refresh
               </button>
             </div>
@@ -164,6 +279,7 @@ function App() {
           <div className="trmnl-info-right">
             <button
               onClick={nextScreen}
+              type="button"
               disabled={isLoading}
               className="trmnl-button trmnl-button-small"
               title="Next screen"
@@ -172,6 +288,7 @@ function App() {
             </button>
             <button
               onClick={forceRefresh}
+              type="button"
               disabled={isLoading}
               className="trmnl-button trmnl-button-small"
               title="Refresh now"
@@ -207,6 +324,7 @@ function App() {
             </div> */}
             <button
               onClick={() => setShowSettings(!showSettings)}
+              type="button"
               className="trmnl-button trmnl-button-small"
               title="Settings"
             >
@@ -221,36 +339,65 @@ function App() {
             <h3>Settings</h3>
 
             <div className="trmnl-settings-section">
-              <label>API Key</label>
+              <label htmlFor="server-url-input">Server URL</label>
               <div className="trmnl-input-group">
                 <input
+                  id="server-url-input"
+                  type="text"
+                  value={serverUrlInput}
+                  onChange={(e) => setServerUrlInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void handleSaveSettings()}
+                  placeholder="https://paper.example.com"
+                  className="trmnl-input"
+                />
+              </div>
+            </div>
+
+            <div className="trmnl-settings-section">
+              <label htmlFor="mac-address-input">MAC Address (Optional)</label>
+              <div className="trmnl-input-group">
+                <input
+                  id="mac-address-input"
+                  type="text"
+                  value={macAddressInput}
+                  onChange={(e) => setMacAddressInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void handleSaveSettings()}
+                  placeholder="41:B4:10:39:A1:24"
+                  className="trmnl-input"
+                />
+              </div>
+            </div>
+
+            <div className="trmnl-settings-section">
+              <label htmlFor="api-key-input">API Key</label>
+              <div className="trmnl-input-group">
+                <input
+                  id="api-key-input"
                   type="text"
                   value={apiKeyInput}
                   onChange={(e) => setApiKeyInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleSaveApiKey()}
-                  placeholder="Enter new API key"
+                  onKeyDown={(e) => e.key === "Enter" && void handleSaveSettings()}
+                  placeholder="Paste your device API key"
                   className="trmnl-input"
                 />
-                <button
-                  onClick={handleSaveApiKey}
-                  className="trmnl-button"
-                  disabled={!apiKeyInput.trim()}
-                >
-                  Save
-                </button>
               </div>
             </div>
 
             <div className="trmnl-settings-actions">
-              <button onClick={loadDevices} className="trmnl-button">
-                Reload Devices
+              <button
+                onClick={() => void handleSaveSettings()}
+                type="button"
+                className="trmnl-button trmnl-button-primary"
+              >
+                Save
               </button>
               <button
                 onClick={() => {
                   localStorage.clear();
                   window.location.reload();
                 }}
-                className="trmnl-button trmnl-button-danger"
+                type="button"
+                className="trmnl-button"
               >
                 Reset
               </button>
