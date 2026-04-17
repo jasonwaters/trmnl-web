@@ -1,5 +1,5 @@
-// TRMNL API Service
-// Handles communication with the TRMNL API
+// Device API service
+// Handles communication with Larapaper-compatible endpoints
 
 import { debugLog } from "./debug";
 
@@ -38,6 +38,7 @@ export interface TrmnlState {
   environment: Environment;
   baseUrl: string;
   macAddress: string | null;
+  refreshIntervalOverride: number | null;
   devices: Device[];
   selectedDevice: Device | null;
   currentImage: CurrentImage | null;
@@ -54,6 +55,7 @@ const STORAGE_KEYS = {
   environment: "trmnl_environment",
   baseUrl: "trmnl_baseUrl",
   macAddress: "trmnl_macAddress",
+  refreshIntervalOverride: "trmnl_refreshIntervalOverride",
   devices: "trmnl_devices",
   selectedDevice: "trmnl_selectedDevice",
   currentImage: "trmnl_currentImage",
@@ -141,6 +143,39 @@ function resolveDeviceMacAddress(
   return null;
 }
 
+function normalizeRefreshIntervalOverride(
+  input: number | string | null | undefined
+): number | null {
+  if (input === null || input === undefined) {
+    return null;
+  }
+
+  const normalizedValue =
+    typeof input === "number" ? input : Number.parseInt(input.trim(), 10);
+
+  if (!Number.isFinite(normalizedValue)) {
+    return null;
+  }
+
+  const refreshInterval = Math.floor(normalizedValue);
+  if (refreshInterval <= 0) {
+    return null;
+  }
+
+  return refreshInterval;
+}
+
+function resolveRefreshRate(
+  apiRefreshRate: unknown,
+  refreshIntervalOverride: number | null
+): number {
+  const normalizedApiRate = normalizeRefreshIntervalOverride(
+    typeof apiRefreshRate === "number" ? apiRefreshRate : String(apiRefreshRate ?? "")
+  );
+
+  return refreshIntervalOverride ?? normalizedApiRate ?? DEFAULT_REFRESH_RATE;
+}
+
 function buildDeviceHeaders(
   apiKey: string,
   macAddress: string | null,
@@ -161,7 +196,7 @@ function buildDeviceHeaders(
 
 function getCurrentScreenApiUrls(environment: Environment): string[] {
   const baseUrl = getBaseUrl(environment);
-  return [`${baseUrl}/api/display/current`, `${baseUrl}/api/current_screen`];
+  return [`${baseUrl}/api/current_screen`];
 }
 
 function resolveImageUrl(imageUrl: unknown, baseUrl: string): string | null {
@@ -174,6 +209,21 @@ function resolveImageUrl(imageUrl: unknown, baseUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+function isSetupPlaceholderImage(
+  imageUrl: string | null,
+  filename: unknown
+): boolean {
+  const normalizedFilename =
+    typeof filename === "string" ? filename.trim().toLowerCase() : "";
+  const normalizedUrl = imageUrl?.toLowerCase() ?? "";
+
+  if (normalizedFilename.includes("setup-logo")) {
+    return true;
+  }
+
+  return normalizedUrl.includes("setup-logo");
 }
 
 async function createHttpError(
@@ -255,6 +305,9 @@ export function getState(): TrmnlState {
       STORAGE_KEYS.macAddress,
       runtimeMacAddress
     ),
+    refreshIntervalOverride: normalizeRefreshIntervalOverride(
+      getStorageItem<number | null>(STORAGE_KEYS.refreshIntervalOverride, null)
+    ),
     devices,
     selectedDevice,
     currentImage: getStorageItem<CurrentImage | null>(
@@ -283,6 +336,12 @@ export function updateState(updates: Partial<TrmnlState>): TrmnlState {
   }
   if (updates.macAddress !== undefined) {
     setStorageItem(STORAGE_KEYS.macAddress, updates.macAddress);
+  }
+  if (updates.refreshIntervalOverride !== undefined) {
+    setStorageItem(
+      STORAGE_KEYS.refreshIntervalOverride,
+      updates.refreshIntervalOverride
+    );
   }
   if (updates.devices !== undefined) {
     setStorageItem(STORAGE_KEYS.devices, updates.devices);
@@ -327,7 +386,7 @@ function getBaseUrl(environment: Environment): string {
 }
 
 export function getDevicesUrl(environment: Environment): string {
-  return `${getBaseUrl(environment)}/devices.json`;
+  return `${getBaseUrl(environment)}/api/devices`;
 }
 
 export function getApiUrl(environment: Environment): string {
@@ -366,6 +425,28 @@ export function setMacAddress(macAddress: string): string | null {
   }
 
   updateState({ macAddress: normalizedMacAddress, lastError: null });
+  return null;
+}
+
+export function setRefreshIntervalOverride(refreshInterval: string): string | null {
+  const normalizedInput = refreshInterval.trim();
+  if (!normalizedInput) {
+    updateState({ refreshIntervalOverride: null, lastError: null });
+    return null;
+  }
+
+  if (!/^\d+$/.test(normalizedInput)) {
+    return "Refresh Interval must be a positive whole number.";
+  }
+
+  const parsedInterval = Number.parseInt(normalizedInput, 10);
+  const normalizedInterval = normalizeRefreshIntervalOverride(parsedInterval);
+  if (!normalizedInterval) {
+    updateState({ refreshIntervalOverride: null, lastError: null });
+    return null;
+  }
+
+  updateState({ refreshIntervalOverride: normalizedInterval, lastError: null });
   return null;
 }
 
@@ -413,7 +494,10 @@ export async function fetchDevices(
       throw await createHttpError(response, "Device list request");
     }
 
-    const devices: Device[] = await response.json();
+    const payload: unknown = await response.json();
+    const devices = Array.isArray(payload)
+      ? (payload as Device[])
+      : (payload as { data?: Device[] })?.data ?? [];
 
     // Store the devices
     updateState({ devices, lastError: null });
@@ -508,6 +592,7 @@ export async function fetchNextScreen(): Promise<string | null> {
     baseUrl,
     selectedDevice,
     macAddress: stateMacAddress,
+    refreshIntervalOverride,
     retryAfter,
     retryCount,
   } = state;
@@ -578,12 +663,17 @@ export async function fetchNextScreen(): Promise<string | null> {
     const data = await response.json();
     const imageUrl = resolveImageUrl(data.image_url, baseUrl || getBaseUrl(environment));
     const filename = data.filename || "display.jpg";
-    const refreshRate = data.refresh_rate || DEFAULT_REFRESH_RATE;
+    const refreshRate = resolveRefreshRate(
+      data.refresh_rate,
+      refreshIntervalOverride
+    );
     const currentTime = Date.now();
     debugLog("Next screen metadata parsed", {
       imageUrl,
       filename,
       refreshRate,
+      apiRefreshRate: data.refresh_rate ?? null,
+      refreshIntervalOverride,
       rawImageUrl: data.image_url ?? null,
     });
 
@@ -743,6 +833,7 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
     baseUrl,
     selectedDevice,
     macAddress: stateMacAddress,
+    refreshIntervalOverride,
     currentImage,
     retryAfter,
     retryCount,
@@ -768,12 +859,11 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
   const effectiveBaseUrl = baseUrl || getBaseUrl(environment);
 
   // Use /api/display when we explicitly want a fresh render (first setup or force refresh).
-  // If /api/display is unavailable on a BYOS implementation, fall back to current-screen endpoints.
+  // For Larapaper compatibility, the fallback endpoint is /api/current_screen.
   const shouldUseDisplayEndpoint = isFirstSetup || forceRefresh;
   const apiUrls = shouldUseDisplayEndpoint
     ? [
         `${effectiveBaseUrl}/api/display`,
-        `${effectiveBaseUrl}/api/display/current`,
         `${effectiveBaseUrl}/api/current_screen`,
       ]
     : getCurrentScreenApiUrls(environment);
@@ -795,7 +885,7 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
     let response: Response | null = null;
     let apiUrlUsed = apiUrls[0];
 
-    // Fetch metadata with endpoint fallback for BYOS compatibility
+    // Fetch metadata with endpoint fallback for Larapaper compatibility.
     for (const candidateUrl of apiUrls) {
       apiUrlUsed = candidateUrl;
       response = await fetch(candidateUrl, {
@@ -860,15 +950,35 @@ export async function fetchImage(forceRefresh = false): Promise<string | null> {
     const data = await response.json();
     const imageUrl = resolveImageUrl(data.image_url, effectiveBaseUrl);
     const filename = data.filename || "display.jpg";
-    const refreshRate = data.refresh_rate || DEFAULT_REFRESH_RATE;
+    const refreshRate = resolveRefreshRate(
+      data.refresh_rate,
+      refreshIntervalOverride
+    );
     const currentTime = Date.now();
     debugLog("Display metadata parsed", {
       imageUrl,
       filename,
       refreshRate,
+      apiRefreshRate: data.refresh_rate ?? null,
+      refreshIntervalOverride,
       rawImageUrl: data.image_url ?? null,
       renderedAt: data.rendered_at ?? null,
     });
+
+    if (
+      !forceRefresh &&
+      !shouldUseDisplayEndpoint &&
+      isSetupPlaceholderImage(imageUrl, filename)
+    ) {
+      debugLog(
+        "Current-screen endpoint returned setup placeholder; forcing display refresh",
+        {
+          imageUrl,
+          filename,
+        }
+      );
+      return fetchImage(true);
+    }
 
     if (!imageUrl) {
       if (

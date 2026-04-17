@@ -9,6 +9,7 @@ import {
   setEnvironment,
   setBaseUrl,
   setMacAddress,
+  setRefreshIntervalOverride,
   formatTimeRemaining,
   getLoginUrl,
   updateState,
@@ -48,6 +49,15 @@ function wrappedSetBaseUrl(baseUrl: string) {
 
 function wrappedSetMacAddress(macAddress: string) {
   const validationError = setMacAddress(macAddress);
+  if (validationError) {
+    return validationError;
+  }
+  notifyStateChange();
+  return null;
+}
+
+function wrappedSetRefreshInterval(refreshInterval: string) {
+  const validationError = setRefreshIntervalOverride(refreshInterval);
   if (validationError) {
     return validationError;
   }
@@ -277,6 +287,29 @@ export function useTrmnl() {
     }
   }, [state.nextFetch, setupRefreshTimer]);
 
+  // When the tab becomes visible again, fetch immediately if scheduled refresh is overdue.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      const currentState = getState();
+      if (!currentState.nextFetch) {
+        return;
+      }
+
+      if (Date.now() >= currentState.nextFetch) {
+        void loadImage();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [loadImage]);
+
   // Change selected device
   const changeDevice = useCallback((device: Device) => {
     wrappedSelectDevice(device);
@@ -366,6 +399,21 @@ export function useTrmnl() {
     [refreshState]
   );
 
+  const changeRefreshInterval = useCallback(
+    async (refreshInterval: string) => {
+      const validationError = wrappedSetRefreshInterval(refreshInterval);
+      if (validationError) {
+        setError(validationError);
+        return false;
+      }
+
+      setError(null);
+      refreshState();
+      return true;
+    },
+    [refreshState]
+  );
+
   const changeApiKey = useCallback(
     async (apiKey: string) => {
       const trimmedApiKey = apiKey.trim();
@@ -436,6 +484,7 @@ export function useTrmnl() {
     changeEnvironment,
     changeBaseUrl,
     changeMacAddress,
+    changeRefreshInterval,
     changeApiKey,
     saveManualApiKey,
     openLogin,

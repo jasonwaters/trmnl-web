@@ -98,7 +98,7 @@ paths:
                     type: string
                     nullable: true
                     example: identify
-  "/api/display/current":
+  "/api/current_screen":
     get:
       summary: Fetch the current screen
       tags:

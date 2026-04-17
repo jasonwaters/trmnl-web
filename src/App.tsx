@@ -14,6 +14,7 @@ function App() {
     changeDevice,
     changeBaseUrl,
     changeMacAddress,
+    changeRefreshInterval,
     changeApiKey,
   } = useTrmnl();
 
@@ -23,11 +24,15 @@ function App() {
     devices,
     baseUrl,
     macAddress,
+    refreshIntervalOverride,
   } = state;
   const [showSettings, setShowSettings] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState(selectedDevice?.api_key ?? "");
   const [serverUrlInput, setServerUrlInput] = useState(baseUrl);
   const [macAddressInput, setMacAddressInput] = useState(macAddress ?? "");
+  const [refreshIntervalInput, setRefreshIntervalInput] = useState(
+    refreshIntervalOverride ? String(refreshIntervalOverride) : ""
+  );
   const dashboardUrl = `${baseUrl}/dashboard`;
 
   useEffect(() => {
@@ -42,11 +47,18 @@ function App() {
     setApiKeyInput(selectedDevice?.api_key ?? "");
   }, [selectedDevice?.api_key]);
 
+  useEffect(() => {
+    setRefreshIntervalInput(
+      refreshIntervalOverride ? String(refreshIntervalOverride) : ""
+    );
+  }, [refreshIntervalOverride]);
+
   const saveConnectionConfig = async (
     options: { requireApiKey: boolean; refreshAfterSave: boolean }
   ) => {
     const normalizedServerUrl = serverUrlInput.trim();
     const normalizedMacAddress = macAddressInput.trim();
+    const normalizedRefreshInterval = refreshIntervalInput.trim();
     const normalizedApiKey = apiKeyInput.trim();
 
     if (options.requireApiKey && !normalizedApiKey) {
@@ -63,6 +75,18 @@ function App() {
     if (normalizedMacAddress !== (macAddress ?? "")) {
       const macSaved = await changeMacAddress(normalizedMacAddress);
       if (!macSaved) {
+        return false;
+      }
+    }
+
+    const currentRefreshInterval = refreshIntervalOverride
+      ? String(refreshIntervalOverride)
+      : "";
+    if (normalizedRefreshInterval !== currentRefreshInterval) {
+      const refreshIntervalSaved = await changeRefreshInterval(
+        normalizedRefreshInterval
+      );
+      if (!refreshIntervalSaved) {
         return false;
       }
     }
@@ -378,6 +402,25 @@ function App() {
                   onChange={(e) => setApiKeyInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && void handleSaveSettings()}
                   placeholder="Paste your device API key"
+                  className="trmnl-input"
+                />
+              </div>
+            </div>
+
+            <div className="trmnl-settings-section">
+              <label htmlFor="refresh-interval-input">
+                Refresh Interval (seconds)
+              </label>
+              <div className="trmnl-input-group">
+                <input
+                  id="refresh-interval-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={refreshIntervalInput}
+                  onChange={(e) => setRefreshIntervalInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void handleSaveSettings()}
+                  placeholder="Defaults to device refresh rate"
                   className="trmnl-input"
                 />
               </div>

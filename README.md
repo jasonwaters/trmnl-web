@@ -1,17 +1,18 @@
 # TRMNL Web
 
-A web application that displays a TRMNL-compatible device screen in your browser. It started as a web alternative to the [TRMNL Chrome Extension](https://github.com/usetrmnl/trmnl-chrome) and now supports BYOS servers such as Larapaper.
+A web application that displays a Larapaper device screen in your browser.
 
 ## Features
 
-- **BYOS Server Support**: Configure a custom TRMNL-compatible server URL
+- **Larapaper Server Support**: Configure your Larapaper server URL
 - **Device Mapping Support**: Optional MAC address support for servers that require API key + MAC routing
 - **Single-Step Setup**: `Connect` saves server URL, optional MAC, and API key together
-- **Display TRMNL Screen**: View your device display directly in your browser
+- **Display Device Screen**: View your device display directly in your browser
 - **Auto Refresh**: Automatically fetches new images at the interval set by your device (default: 30 seconds)
 - **Countdown Timer**: Shows time until next refresh
 - **Manual Refresh**: Force refresh the display at any time
-- **Multi-Device Support**: Switch between multiple TRMNL devices (if you have more than one)
+- **Refresh Interval Override**: Optionally override device `refresh_rate` in settings
+- **Multi-Device Support**: Switch between multiple Larapaper devices (if you have more than one)
 - **Privacy-Oriented Rendering**: Images are rendered as encoded data URLs in the browser
 - **Persistent Storage**: Connection settings and cached image metadata are stored in localStorage
 - **Dark/Light Mode**: E-ink display filters adapt to your system preference
@@ -20,7 +21,7 @@ A web application that displays a TRMNL-compatible device screen in your browser
 
 ### Prerequisites
 
-- A TRMNL-compatible server account (official TRMNL or a BYOS server such as Larapaper)
+- A Larapaper server account
 - Bun installed
 
 ### Installation
@@ -81,7 +82,7 @@ docker compose up --build -d
 ### Setup
 
 1. **Server URL**
-   - Enter your TRMNL-compatible server URL (for example `https://paper.example.com`)
+   - Enter your Larapaper server URL (for example `https://paper.example.com`)
 2. **MAC Address (Optional)**
    - If your server maps requests by API key + MAC, enter MAC in `AA:BB:CC:DD:EE:FF` format
 3. **API Key + Connect**
@@ -93,7 +94,7 @@ docker compose up --build -d
 
 1. **Metadata Fetching**
    - Uses `/api/display` for first setup and explicit forced refreshes
-   - Uses `/api/display/current` and falls back to `/api/current_screen` for current-screen polling
+   - Uses `/api/current_screen` for current-screen polling
 2. **Device Headers**
    - Sends `Access-Token` for device authentication
    - Sends optional `ID` header when MAC address is configured
@@ -109,10 +110,8 @@ docker compose up --build -d
 | Endpoint (base URL configurable) | Purpose |
 | --- | --- |
 | `/api/display` | Fetch/generate next display image metadata |
-| `/api/display/current` | Preferred current-screen endpoint |
-| `/api/current_screen` | Legacy fallback current-screen endpoint |
-| `/devices.json` | Optional device list endpoint (cookie auth, same-origin/CORS dependent) |
-| `/login` | Login page link for configured server |
+| `/api/current_screen` | Read the currently displayed screen |
+| `/api/devices` | Optional device list endpoint (cookie auth via Sanctum session) |
 
 Set a default server host via `VITE_TRMNL_BASE_URL`:
 
